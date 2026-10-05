@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="DriveTester.csproj" />
+  <Project Path="DriveTester.Tests/DriveTester.Tests.csproj" />
+</Solution>
