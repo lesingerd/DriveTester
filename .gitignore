@@ -1,0 +1,33 @@
+## Build results
+[Bb]in/
+[Oo]bj/
+publish/
+[Ll]og/
+[Ll]ogs/
+*.log
+
+## Visual Studio 2022 / IDE files
+.vs/
+*.user
+*.userprefs
+*.suo
+*.sln.docstates
+*.userosscache
+
+## Test results
+TestResults/
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+
+## Test data & artifacts from local runs
+DriveTester_Test_Data/
+DriveTester_IntegrityTest/
+*.tst
+
+## Operating System Files
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
