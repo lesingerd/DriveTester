@@ -1,8 +1,10 @@
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Windows;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using DriveTester.Models;
 using DriveTester.Services;
 using Microsoft.Win32;
@@ -11,8 +13,11 @@ namespace DriveTester.ViewModels;
 
 public class MainViewModel : ViewModelBase
 {
+    private readonly object _logsLock = new();
     private DriveTestEngine? _engine;
     private DriveTargetInfo? _selectedDrive;
+    private TestSessionState? _resumableSession;
+
     private int _rounds = 2;
     private CapacityTargetMode _selectedTargetMode = CapacityTargetMode.SafeFreeSpace95Percent;
     private double _customCapacityGB = 100.0;
@@ -63,6 +68,7 @@ public class MainViewModel : ViewModelBase
                 OnPropertyChanged(nameof(IsSystemDriveSelected));
                 OnPropertyChanged(nameof(DriveSummaryText));
                 OnPropertyChanged(nameof(TargetCapacityCalculationText));
+                CheckResumableSession();
             }
         }
     }
@@ -136,6 +142,8 @@ public class MainViewModel : ViewModelBase
                 OnPropertyChanged(nameof(CanStopTest));
                 OnPropertyChanged(nameof(CanPauseResume));
                 OnPropertyChanged(nameof(CanExportReport));
+                OnPropertyChanged(nameof(HasResumableSession));
+                OnPropertyChanged(nameof(CanResumeTest));
             }
         }
     }
@@ -158,6 +166,12 @@ public class MainViewModel : ViewModelBase
     public bool CanPauseResume => IsTesting;
     public bool CanExportReport => _lastReport != null;
     public bool IsSystemDriveSelected => SelectedDrive?.IsSystemDrive ?? false;
+
+    public bool HasResumableSession => _resumableSession != null && !IsTesting;
+    public bool CanResumeTest => HasResumableSession && !IsTesting;
+    public string ResumableSessionBanner => _resumableSession != null
+        ? $"Interrupted test found on {SelectedDrive?.DriveLetter}: Round {_resumableSession.CurrentRound} of {_resumableSession.PlannedRounds} (Phase: {_resumableSession.CurrentPhase})"
+        : string.Empty;
 
     public string PauseResumeButtonText => IsPaused ? "Resume Test" : "Pause Test";
 
@@ -264,6 +278,8 @@ public class MainViewModel : ViewModelBase
 
     public ICommand RefreshDrivesCommand { get; }
     public ICommand StartTestCommand { get; }
+    public ICommand ResumeTestCommand { get; }
+    public ICommand DiscardSessionCommand { get; }
     public ICommand PauseResumeCommand { get; }
     public ICommand StopTestCommand { get; }
     public ICommand CleanTestFilesCommand { get; }
@@ -273,16 +289,48 @@ public class MainViewModel : ViewModelBase
 
     public MainViewModel()
     {
+        BindingOperations.EnableCollectionSynchronization(Logs, _logsLock);
+
         RefreshDrivesCommand = new RelayCommand(RefreshDrives);
-        StartTestCommand = new RelayCommand(async () => await StartTestAsync(), () => CanStartTest);
+        StartTestCommand = new RelayCommand(async () => await StartTestAsync(resume: false), () => CanStartTest);
+        ResumeTestCommand = new RelayCommand(async () => await StartTestAsync(resume: true), () => CanResumeTest);
+        DiscardSessionCommand = new RelayCommand(DiscardInterruptedSession, () => HasResumableSession);
         PauseResumeCommand = new RelayCommand(TogglePauseResume, () => CanPauseResume);
         StopTestCommand = new RelayCommand(StopTest, () => CanStopTest);
         CleanTestFilesCommand = new RelayCommand(async () => await CleanTestFilesAsync(), () => !IsTesting && SelectedDrive != null);
         ExportReportCommand = new RelayCommand(ExportReport, () => CanExportReport);
         CopyReportCommand = new RelayCommand(CopyReport, () => CanExportReport);
-        ClearLogsCommand = new RelayCommand(Logs.Clear);
+        ClearLogsCommand = new RelayCommand(() =>
+        {
+            lock (_logsLock) { Logs.Clear(); }
+        });
 
         RefreshDrives();
+    }
+
+    public void CheckResumableSession()
+    {
+        _resumableSession = DriveTestEngine.TryGetResumableSession(SelectedDrive);
+        OnPropertyChanged(nameof(HasResumableSession));
+        OnPropertyChanged(nameof(CanResumeTest));
+        OnPropertyChanged(nameof(ResumableSessionBanner));
+    }
+
+    private void DiscardInterruptedSession()
+    {
+        if (SelectedDrive == null) return;
+        var result = MessageBox.Show(
+            $"Discard interrupted test session for drive {SelectedDrive.DriveLetter}?\n\nExisting partial test files will be cleaned if you choose 'Clean Leftover Test Files'.",
+            "Discard Interrupted Session",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (result == MessageBoxResult.Yes)
+        {
+            DriveTestEngine.DiscardSession(SelectedDrive);
+            CheckResumableSession();
+            AddLog(LogLevel.Info, $"Discarded previous test session state on {SelectedDrive.DriveLetter}.");
+        }
     }
 
     public void RefreshDrives()
@@ -307,6 +355,7 @@ public class MainViewModel : ViewModelBase
         }
 
         AddLog(LogLevel.Info, $"Found {Drives.Count} active storage drive(s).");
+        CheckResumableSession();
 
         // 2. Enrich WMI metadata (model, USB bus) asynchronously in background
         _ = Task.Run(async () =>
@@ -327,9 +376,35 @@ public class MainViewModel : ViewModelBase
         });
     }
 
-    private async Task StartTestAsync()
+    private async Task StartTestAsync(bool resume = false)
     {
         if (SelectedDrive == null) return;
+
+        if (!resume && HasResumableSession && _resumableSession != null)
+        {
+            var res = MessageBox.Show(
+                $"An interrupted test session was found on drive {SelectedDrive.DriveLetter}:\n\n" +
+                $"• Round: {_resumableSession.CurrentRound} of {_resumableSession.PlannedRounds}\n" +
+                $"• Phase: {_resumableSession.CurrentPhase}\n\n" +
+                "Would you like to RESUME this test from where it stopped?\n\n" +
+                "• Click 'Yes' to RESUME (any partially written file will be recreated).\n" +
+                "• Click 'No' to DISCARD old session and start a new test from scratch.\n" +
+                "• Click 'Cancel' to abort.",
+                "Interrupted Test Detected",
+                MessageBoxButton.YesNoCancel,
+                MessageBoxImage.Question);
+
+            if (res == MessageBoxResult.Cancel) return;
+            if (res == MessageBoxResult.Yes)
+            {
+                resume = true;
+            }
+            else
+            {
+                DriveTestEngine.DiscardSession(SelectedDrive);
+                CheckResumableSession();
+            }
+        }
 
         if (SelectedDrive.IsSystemDrive)
         {
@@ -356,19 +431,45 @@ public class MainViewModel : ViewModelBase
         ReportMarkdown = string.Empty;
         _lastReport = null;
 
-        var config = new TestConfiguration
-        {
-            TargetDrive = SelectedDrive,
-            Rounds = Rounds,
-            TargetMode = SelectedTargetMode,
-            CustomCapacityGB = CustomCapacityGB,
-            SizePreset = SelectedPreset,
-            FlushBuffersDirectly = FlushBuffersDirectly,
-            StopOnFirstError = StopOnFirstError,
-            EmptyFilesAfterEachRound = EmptyFilesAfterEachRound
-        };
+        TestSessionState? resumeState = null;
+        TestConfiguration config;
 
-        _engine = new DriveTestEngine(config);
+        if (resume && _resumableSession != null)
+        {
+            resumeState = _resumableSession;
+            config = new TestConfiguration
+            {
+                TargetDrive = SelectedDrive,
+                Rounds = resumeState.PlannedRounds,
+                TargetMode = resumeState.TargetMode,
+                CustomCapacityGB = resumeState.CustomCapacityGB,
+                SizePreset = resumeState.SizePreset,
+                FlushBuffersDirectly = resumeState.FlushBuffersDirectly,
+                StopOnFirstError = resumeState.StopOnFirstError,
+                EmptyFilesAfterEachRound = resumeState.EmptyFilesAfterEachRound
+            };
+
+            foreach (var prevRound in resumeState.CompletedRoundsResults)
+            {
+                RoundResults.Add(prevRound);
+            }
+        }
+        else
+        {
+            config = new TestConfiguration
+            {
+                TargetDrive = SelectedDrive,
+                Rounds = Rounds,
+                TargetMode = SelectedTargetMode,
+                CustomCapacityGB = CustomCapacityGB,
+                SizePreset = SelectedPreset,
+                FlushBuffersDirectly = FlushBuffersDirectly,
+                StopOnFirstError = StopOnFirstError,
+                EmptyFilesAfterEachRound = EmptyFilesAfterEachRound
+            };
+        }
+
+        _engine = new DriveTestEngine(config, resumeState?.BaseSeed);
         _engine.LogEmitted += OnEngineLogEmitted;
         _engine.ProgressUpdated += OnEngineProgressUpdated;
         _engine.RoundCompleted += OnEngineRoundCompleted;
@@ -376,12 +477,13 @@ public class MainViewModel : ViewModelBase
 
         try
         {
-            await _engine.RunAsync();
+            await _engine.RunAsync(resumeState);
         }
         finally
         {
             IsTesting = false;
             IsPaused = false;
+            CheckResumableSession();
         }
     }
 
@@ -427,6 +529,7 @@ public class MainViewModel : ViewModelBase
 
         AddLog(LogLevel.Info, $"Cleaning leftover test files on {SelectedDrive.DriveLetter}...");
         await DriveTestEngine.CleanAllTestFilesAsync(SelectedDrive, "DriveTester_IntegrityTest", msg => AddLog(LogLevel.Info, msg));
+        DriveTestEngine.DiscardSession(SelectedDrive);
         RefreshDrives();
     }
 
@@ -434,13 +537,15 @@ public class MainViewModel : ViewModelBase
     {
         Application.Current?.Dispatcher.InvokeAsync(() =>
         {
-            Logs.Add(entry);
-            // Cap log buffer to 10,000 entries
-            if (Logs.Count > 10000)
+            lock (_logsLock)
             {
-                Logs.RemoveAt(0);
+                Logs.Add(entry);
+                if (Logs.Count > 5000)
+                {
+                    Logs.RemoveAt(0);
+                }
             }
-        });
+        }, DispatcherPriority.Background);
     }
 
     private void OnEngineProgressUpdated(TestProgressUpdate p)
@@ -474,7 +579,7 @@ public class MainViewModel : ViewModelBase
             ErrorCount = p.ErrorCount;
             StatusMessage = p.StatusMessage;
 
-            // Track speed history for live graph (keep latest 120 samples)
+            // Track speed history for live graph (keep latest 150 samples)
             if (p.CurrentSpeedMBps > 0)
             {
                 _speedHistory.Add(p.CurrentSpeedMBps);
@@ -558,10 +663,14 @@ public class MainViewModel : ViewModelBase
 
     private void AddLog(LogLevel level, string msg)
     {
+        var entry = new LogEntry { Level = level, Message = msg };
         Application.Current?.Dispatcher.InvokeAsync(() =>
         {
-            Logs.Add(new LogEntry { Level = level, Message = msg });
-            if (Logs.Count > 10000) Logs.RemoveAt(0);
-        });
+            lock (_logsLock)
+            {
+                Logs.Add(entry);
+                if (Logs.Count > 5000) Logs.RemoveAt(0);
+            }
+        }, DispatcherPriority.Background);
     }
 }

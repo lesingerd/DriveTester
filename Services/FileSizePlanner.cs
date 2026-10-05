@@ -30,7 +30,7 @@ public static class FileSizePlanner
         {
             long chosenSize;
 
-            if (remaining < 1L * 1024 * 1024)
+            if (remaining < 512L * 1024)
             {
                 chosenSize = remaining;
             }
@@ -38,35 +38,42 @@ public static class FileSizePlanner
             {
                 int roll = rng.Next(100);
 
+                var fitLarge = largePool.Where(s => s <= remaining).ToArray();
+                var fitMedium = mediumPool.Where(s => s <= remaining).ToArray();
+                var fitSmall = smallPool.Where(s => s <= remaining).ToArray();
+
                 if (preset == FileSizePreset.FastSequential)
                 {
-                    // 92% Large, 6% Medium, 2% Small
-                    if (roll < 92)
-                        chosenSize = largePool[rng.Next(largePool.Length)];
-                    else if (roll < 98)
-                        chosenSize = mediumPool[rng.Next(mediumPool.Length)];
+                    if (roll < 92 && fitLarge.Length > 0)
+                        chosenSize = fitLarge[rng.Next(fitLarge.Length)];
+                    else if (roll < 98 && fitMedium.Length > 0)
+                        chosenSize = fitMedium[rng.Next(fitMedium.Length)];
+                    else if (fitSmall.Length > 0)
+                        chosenSize = fitSmall[rng.Next(fitSmall.Length)];
                     else
-                        chosenSize = smallPool[rng.Next(smallPool.Length)];
+                        chosenSize = remaining;
                 }
                 else if (preset == FileSizePreset.DiverseStress)
                 {
-                    // 40% Large, 35% Medium, 25% Small
-                    if (roll < 40)
-                        chosenSize = largePool[rng.Next(largePool.Length)];
-                    else if (roll < 75)
-                        chosenSize = mediumPool[rng.Next(mediumPool.Length)];
+                    if (roll < 40 && fitLarge.Length > 0)
+                        chosenSize = fitLarge[rng.Next(fitLarge.Length)];
+                    else if (roll < 75 && fitMedium.Length > 0)
+                        chosenSize = fitMedium[rng.Next(fitMedium.Length)];
+                    else if (fitSmall.Length > 0)
+                        chosenSize = fitSmall[rng.Next(fitSmall.Length)];
                     else
-                        chosenSize = smallPool[rng.Next(smallPool.Length)];
+                        chosenSize = remaining;
                 }
                 else // Balanced
                 {
-                    // 70% Large, 20% Medium, 10% Small
-                    if (roll < 70)
-                        chosenSize = largePool[rng.Next(largePool.Length)];
-                    else if (roll < 90)
-                        chosenSize = mediumPool[rng.Next(mediumPool.Length)];
+                    if (roll < 70 && fitLarge.Length > 0)
+                        chosenSize = fitLarge[rng.Next(fitLarge.Length)];
+                    else if (roll < 90 && fitMedium.Length > 0)
+                        chosenSize = fitMedium[rng.Next(fitMedium.Length)];
+                    else if (fitSmall.Length > 0)
+                        chosenSize = fitSmall[rng.Next(fitSmall.Length)];
                     else
-                        chosenSize = smallPool[rng.Next(smallPool.Length)];
+                        chosenSize = remaining;
                 }
 
                 if (chosenSize > remaining)

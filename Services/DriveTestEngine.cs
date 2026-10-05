@@ -7,7 +7,8 @@ namespace DriveTester.Services;
 public class DriveTestEngine
 {
     private readonly TestConfiguration _config;
-    private readonly ulong _baseSeed;
+    private ulong _baseSeed;
+    private TestSessionState? _sessionState;
 
     private readonly ManualResetEventSlim _pauseEvent = new(true);
     private CancellationTokenSource? _cts;
@@ -21,11 +22,12 @@ public class DriveTestEngine
 
     public bool IsRunning { get; private set; }
     public bool IsPaused => _isPaused;
+    public TestSessionState? SessionState => _sessionState;
 
-    public DriveTestEngine(TestConfiguration config)
+    public DriveTestEngine(TestConfiguration config, ulong? customSeed = null)
     {
         _config = config;
-        _baseSeed = (ulong)DateTime.UtcNow.Ticks ^ 0xA5A5A5A55A5A5A5AUL;
+        _baseSeed = customSeed ?? ((ulong)DateTime.UtcNow.Ticks ^ 0xA5A5A5A55A5A5A5AUL);
     }
 
     public void Pause()
@@ -35,6 +37,12 @@ public class DriveTestEngine
             _isPaused = true;
             _pauseEvent.Reset();
             EmitLog(LogLevel.Info, "Test execution PAUSED.");
+
+            if (_config.TargetDrive != null && _sessionState != null)
+            {
+                _sessionState.IsGracefullyPaused = true;
+                _sessionState.Save(_config.TargetDrive.DriveLetter, _config.TestFolderName);
+            }
         }
     }
 
@@ -45,6 +53,12 @@ public class DriveTestEngine
             _isPaused = false;
             _pauseEvent.Set();
             EmitLog(LogLevel.Info, "Test execution RESUMED.");
+
+            if (_config.TargetDrive != null && _sessionState != null)
+            {
+                _sessionState.IsGracefullyPaused = false;
+                _sessionState.Save(_config.TargetDrive.DriveLetter, _config.TestFolderName);
+            }
         }
     }
 
@@ -54,11 +68,18 @@ public class DriveTestEngine
         {
             EmitLog(LogLevel.Warning, "Cancellation requested by user. Aborting test safely...");
             _pauseEvent.Set(); // ensure not blocked in wait
+
+            if (_config.TargetDrive != null && _sessionState != null)
+            {
+                _sessionState.Status = SessionStatus.Aborted;
+                _sessionState.Save(_config.TargetDrive.DriveLetter, _config.TestFolderName);
+            }
+
             _cts?.Cancel();
         }
     }
 
-    public async Task<FinalTestReport> RunAsync()
+    public async Task<FinalTestReport> RunAsync(TestSessionState? resumeState = null)
     {
         if (_config.TargetDrive == null)
             throw new InvalidOperationException("No target drive selected.");
@@ -77,30 +98,68 @@ public class DriveTestEngine
         if (!driveRoot.EndsWith('\\')) driveRoot += "\\";
         var testRootDir = Path.Combine(driveRoot, _config.TestFolderName);
 
-        EmitLog(LogLevel.Info, $"==================================================");
-        EmitLog(LogLevel.Info, $"Starting Drive Integrity Test Suite on {driveRoot}");
-        EmitLog(LogLevel.Info, $"Drive: {_config.TargetDrive.ModelName} ({_config.TargetDrive.TotalSizeGB:F1} GB total, {_config.TargetDrive.FreeSpaceGB:F1} GB free)");
-        EmitLog(LogLevel.Info, $"Rounds planned: {_config.Rounds} | Target Mode: {_config.TargetMode} | Preset: {_config.SizePreset}");
-        EmitLog(LogLevel.Info, $"Direct Write-Through (bypass OS cache): {_config.FlushBuffersDirectly}");
-        EmitLog(LogLevel.Info, $"==================================================");
-
-        long overallTotalBytesToProcess = 0;
-        // Pre-calculate estimated bytes across all rounds (each round writes + verifies = 2x target bytes)
         var driveInfo = new DriveInfo(driveRoot);
         long targetBytesPerRound = _config.CalculateTargetBytes(driveInfo.AvailableFreeSpace);
-        overallTotalBytesToProcess = targetBytesPerRound * 2 * _config.Rounds;
 
-        _overallBytesProcessed = 0;
+        int startRound = 1;
+        if (resumeState != null)
+        {
+            _sessionState = resumeState;
+            _baseSeed = resumeState.BaseSeed;
+            startRound = Math.Max(1, resumeState.CurrentRound);
+            if (resumeState.CompletedRoundsResults.Count > 0)
+            {
+                roundResults.AddRange(resumeState.CompletedRoundsResults);
+            }
+            if (resumeState.TargetBytesPerRound > 0)
+            {
+                targetBytesPerRound = resumeState.TargetBytesPerRound;
+            }
+
+            EmitLog(LogLevel.Warning, $"==================================================");
+            EmitLog(LogLevel.Warning, $"RESUMING INTERRUPTED TEST SESSION on {driveRoot}");
+            EmitLog(LogLevel.Warning, $"Resuming from Round {startRound} of {_config.Rounds} (Last Phase: {resumeState.CurrentPhase})");
+            EmitLog(LogLevel.Warning, $"==================================================");
+        }
+        else
+        {
+            _sessionState = new TestSessionState
+            {
+                BaseSeed = _baseSeed,
+                PlannedRounds = _config.Rounds,
+                TargetMode = _config.TargetMode,
+                CustomCapacityGB = _config.CustomCapacityGB,
+                SizePreset = _config.SizePreset,
+                FlushBuffersDirectly = _config.FlushBuffersDirectly,
+                StopOnFirstError = _config.StopOnFirstError,
+                EmptyFilesAfterEachRound = _config.EmptyFilesAfterEachRound,
+                TargetBytesPerRound = targetBytesPerRound,
+                CurrentRound = 1,
+                CurrentPhase = TestPhase.Writing,
+                IsGracefullyPaused = false
+            };
+            _sessionState.Save(driveRoot, _config.TestFolderName);
+
+            EmitLog(LogLevel.Info, $"==================================================");
+            EmitLog(LogLevel.Info, $"Starting Drive Integrity Test Suite on {driveRoot}");
+            EmitLog(LogLevel.Info, $"Drive: {_config.TargetDrive.ModelName} ({_config.TargetDrive.TotalSizeGB:F1} GB total, {_config.TargetDrive.FreeSpaceGB:F1} GB free)");
+            EmitLog(LogLevel.Info, $"Rounds planned: {_config.Rounds} | Target Mode: {_config.TargetMode} | Preset: {_config.SizePreset}");
+            EmitLog(LogLevel.Info, $"Direct Write-Through (bypass OS cache): {_config.FlushBuffersDirectly}");
+            EmitLog(LogLevel.Info, $"==================================================");
+        }
+
+        long overallTotalBytesToProcess = targetBytesPerRound * 2 * _config.Rounds;
+        _overallBytesProcessed = roundResults.Sum(r => r.BytesWritten + r.BytesVerified);
         var overallStopwatch = Stopwatch.StartNew();
 
-        int completedRounds = 0;
+        int completedRounds = roundResults.Count;
         bool aborted = false;
 
         try
         {
             Directory.CreateDirectory(testRootDir);
 
-            for (int r = 1; r <= _config.Rounds; r++)
+            for (int r = startRound; r <= _config.Rounds; r++)
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -110,9 +169,13 @@ public class DriveTestEngine
                 var roundDir = Path.Combine(testRootDir, $"Round_{r:D2}");
                 Directory.CreateDirectory(roundDir);
 
-                // Refresh free space for round
-                driveInfo = new DriveInfo(driveRoot);
-                long currentRoundTargetBytes = _config.CalculateTargetBytes(driveInfo.AvailableFreeSpace);
+                long currentRoundTargetBytes = targetBytesPerRound;
+                if (currentRoundTargetBytes <= 0)
+                {
+                    driveInfo = new DriveInfo(driveRoot);
+                    currentRoundTargetBytes = _config.CalculateTargetBytes(driveInfo.AvailableFreeSpace);
+                }
+
                 if (currentRoundTargetBytes <= 0)
                 {
                     EmitLog(LogLevel.Error, $"Not enough free disk space on {driveRoot} to execute Round {r}.");
@@ -125,70 +188,110 @@ public class DriveTestEngine
 
                 roundResult.TotalFiles = filePlan.Count;
 
+                var activeResumeState = (resumeState != null && r == resumeState.CurrentRound) ? resumeState : null;
+                var writtenFiles = new List<TestFileInfo>();
+
                 // ==========================================
                 // PHASE 1: WRITE PHASE
                 // ==========================================
-                EmitLog(LogLevel.Info, $"Round {r}: [PHASE 1/3: WRITING FILES TO SSD]");
-                var writeSw = Stopwatch.StartNew();
-                var writtenFiles = new List<TestFileInfo>();
+                bool skipWrite = activeResumeState != null && activeResumeState.CurrentPhase != TestPhase.Writing;
 
-                await WritePhaseAsync(
-                    roundDir,
-                    filePlan,
-                    r,
-                    writtenFiles,
-                    roundResult,
-                    overallTotalBytesToProcess,
-                    overallStopwatch,
-                    ct);
-
-                writeSw.Stop();
-                roundResult.WriteDuration = writeSw.Elapsed;
-                if (roundResult.WriteDuration.TotalSeconds > 0)
+                if (!skipWrite)
                 {
-                    roundResult.AvgWriteSpeedMBps = (roundResult.BytesWritten / (1024.0 * 1024.0)) / roundResult.WriteDuration.TotalSeconds;
-                }
+                    EmitLog(LogLevel.Info, $"Round {r}: [PHASE 1/3: WRITING FILES TO SSD]");
+                    _sessionState.CurrentRound = r;
+                    _sessionState.CurrentPhase = TestPhase.Writing;
+                    _sessionState.IsGracefullyPaused = false;
+                    _sessionState.Save(driveRoot, _config.TestFolderName);
 
-                EmitLog(LogLevel.Success, $"Round {r} Write Phase complete: {roundResult.BytesWritten / (1024.0 * 1024.0 * 1024.0):F2} GB written in {roundResult.WriteDuration:mm\\:ss} (Avg: {roundResult.AvgWriteSpeedMBps:F1} MB/s, Peak: {roundResult.PeakWriteSpeedMBps:F1} MB/s)");
+                    var writeSw = Stopwatch.StartNew();
+
+                    await WritePhaseAsync(
+                        roundDir,
+                        driveRoot,
+                        filePlan,
+                        r,
+                        writtenFiles,
+                        roundResult,
+                        overallTotalBytesToProcess,
+                        overallStopwatch,
+                        activeResumeState,
+                        ct);
+
+                    writeSw.Stop();
+                    roundResult.WriteDuration = writeSw.Elapsed;
+                    if (roundResult.WriteDuration.TotalSeconds > 0)
+                    {
+                        roundResult.AvgWriteSpeedMBps = (roundResult.BytesWritten / (1024.0 * 1024.0)) / roundResult.WriteDuration.TotalSeconds;
+                    }
+
+                    EmitLog(LogLevel.Success, $"Round {r} Write Phase complete: {roundResult.BytesWritten / (1024.0 * 1024.0 * 1024.0):F2} GB written in {roundResult.WriteDuration:mm\\:ss} (Avg: {roundResult.AvgWriteSpeedMBps:F1} MB/s, Peak: {roundResult.PeakWriteSpeedMBps:F1} MB/s)");
+                }
+                else
+                {
+                    EmitLog(LogLevel.Info, $"Round {r}: Resuming directly to {activeResumeState!.CurrentPhase} (Write phase previously finished).");
+                    // Populate writtenFiles from filePlan where file exists on disk
+                    foreach (var file in filePlan)
+                    {
+                        var filePath = Path.Combine(roundDir, file.FileName);
+                        if (File.Exists(filePath))
+                        {
+                            var fi = new FileInfo(filePath);
+                            file.SizeBytes = fi.Length;
+                            writtenFiles.Add(file);
+                            roundResult.BytesWritten += fi.Length;
+                        }
+                    }
+                }
 
                 ct.ThrowIfCancellationRequested();
 
                 // ==========================================
                 // PHASE 2: VERIFICATION PHASE
                 // ==========================================
-                EmitLog(LogLevel.Info, $"Round {r}: [PHASE 2/3: VERIFYING INTEGRITY & DATA CHECKSUMS]");
-                var readSw = Stopwatch.StartNew();
+                bool skipVerify = activeResumeState != null && activeResumeState.CurrentPhase == TestPhase.Emptying;
 
-                await VerifyPhaseAsync(
-                    roundDir,
-                    writtenFiles,
-                    r,
-                    roundResult,
-                    criticalErrors,
-                    overallTotalBytesToProcess,
-                    overallStopwatch,
-                    ct);
+                if (!skipVerify)
+                {
+                    EmitLog(LogLevel.Info, $"Round {r}: [PHASE 2/3: VERIFYING INTEGRITY & DATA CHECKSUMS]");
+                    _sessionState.CurrentRound = r;
+                    _sessionState.CurrentPhase = TestPhase.Verifying;
+                    _sessionState.InFlightFileName = null;
+                    _sessionState.Save(driveRoot, _config.TestFolderName);
 
-                readSw.Stop();
-                roundResult.ReadDuration = readSw.Elapsed;
-                if (roundResult.ReadDuration.TotalSeconds > 0)
-                {
-                    roundResult.AvgReadSpeedMBps = (roundResult.BytesVerified / (1024.0 * 1024.0)) / roundResult.ReadDuration.TotalSeconds;
-                }
+                    var readSw = Stopwatch.StartNew();
 
-                if (roundResult.ErrorCount == 0)
-                {
-                    EmitLog(LogLevel.Success, $"Round {r} Verification complete: 100% MATCH! 0 errors detected. Verified {roundResult.BytesVerified / (1024.0 * 1024.0 * 1024.0):F2} GB in {roundResult.ReadDuration:mm\\:ss} (Avg: {roundResult.AvgReadSpeedMBps:F1} MB/s, Peak: {roundResult.PeakReadSpeedMBps:F1} MB/s)");
-                }
-                else
-                {
-                    EmitLog(LogLevel.Error, $"Round {r} Verification FAILED! Detected {roundResult.ErrorCount} corrupt blocks/checksum errors!");
-                    if (_config.StopOnFirstError)
+                    await VerifyPhaseAsync(
+                        roundDir,
+                        writtenFiles,
+                        r,
+                        roundResult,
+                        criticalErrors,
+                        overallTotalBytesToProcess,
+                        overallStopwatch,
+                        ct);
+
+                    readSw.Stop();
+                    roundResult.ReadDuration = readSw.Elapsed;
+                    if (roundResult.ReadDuration.TotalSeconds > 0)
                     {
-                        EmitLog(LogLevel.Warning, "Stop on first error is enabled. Terminating test early.");
-                        roundResults.Add(roundResult);
-                        RoundCompleted?.Invoke(roundResult);
-                        break;
+                        roundResult.AvgReadSpeedMBps = (roundResult.BytesVerified / (1024.0 * 1024.0)) / roundResult.ReadDuration.TotalSeconds;
+                    }
+
+                    if (roundResult.ErrorCount == 0)
+                    {
+                        EmitLog(LogLevel.Success, $"Round {r} Verification complete: 100% MATCH! 0 errors detected. Verified {roundResult.BytesVerified / (1024.0 * 1024.0 * 1024.0):F2} GB in {roundResult.ReadDuration:mm\\:ss} (Avg: {roundResult.AvgReadSpeedMBps:F1} MB/s, Peak: {roundResult.PeakReadSpeedMBps:F1} MB/s)");
+                    }
+                    else
+                    {
+                        EmitLog(LogLevel.Error, $"Round {r} Verification FAILED! Detected {roundResult.ErrorCount} corrupt blocks/checksum errors!");
+                        if (_config.StopOnFirstError)
+                        {
+                            EmitLog(LogLevel.Warning, "Stop on first error is enabled. Terminating test early.");
+                            roundResults.Add(roundResult);
+                            RoundCompleted?.Invoke(roundResult);
+                            break;
+                        }
                     }
                 }
 
@@ -198,6 +301,10 @@ public class DriveTestEngine
                 if (_config.EmptyFilesAfterEachRound)
                 {
                     EmitLog(LogLevel.Info, $"Round {r}: [PHASE 3/3: EMPTYING TEST FILES FROM DRIVE]");
+                    _sessionState.CurrentRound = r;
+                    _sessionState.CurrentPhase = TestPhase.Emptying;
+                    _sessionState.Save(driveRoot, _config.TestFolderName);
+
                     await EmptyPhaseAsync(roundDir, r, ct);
                     EmitLog(LogLevel.Info, $"Round {r}: Drive emptied. Space reclaimed for next cycle.");
                 }
@@ -209,18 +316,36 @@ public class DriveTestEngine
                 roundResults.Add(roundResult);
                 RoundCompleted?.Invoke(roundResult);
                 completedRounds++;
+
+                _sessionState.CompletedRoundsResults = roundResults.ToList();
+                _sessionState.CurrentRound = r + 1;
+                _sessionState.CurrentPhase = TestPhase.Writing;
+                _sessionState.Save(driveRoot, _config.TestFolderName);
+
+                // Clear resume state once initial resumed round finishes
+                resumeState = null;
             }
         }
         catch (OperationCanceledException)
         {
             aborted = true;
             EmitLog(LogLevel.Warning, "Test was cancelled by user.");
+            if (_sessionState != null)
+            {
+                _sessionState.Status = SessionStatus.Aborted;
+                _sessionState.Save(driveRoot, _config.TestFolderName);
+            }
         }
         catch (Exception ex)
         {
             aborted = true;
             EmitLog(LogLevel.Error, $"Critical error during drive test: {ex.Message}");
             criticalErrors.Add($"Fatal exception: {ex.Message}");
+            if (_sessionState != null)
+            {
+                _sessionState.Status = SessionStatus.Aborted;
+                _sessionState.Save(driveRoot, _config.TestFolderName);
+            }
         }
         finally
         {
@@ -250,6 +375,22 @@ public class DriveTestEngine
             report.OverallAvgReadSpeedMBps = roundResults.Average(r => r.AvgReadSpeedMBps);
         }
 
+        if (!aborted && completedRounds == _config.Rounds)
+        {
+            if (_sessionState != null)
+            {
+                _sessionState.Status = SessionStatus.Completed;
+                if (_config.EmptyFilesAfterEachRound)
+                {
+                    TestSessionState.Delete(driveRoot, _config.TestFolderName);
+                }
+                else
+                {
+                    _sessionState.Save(driveRoot, _config.TestFolderName);
+                }
+            }
+        }
+
         EmitLog(LogLevel.Info, "==================================================");
         EmitLog(report.IsPassed ? LogLevel.Success : LogLevel.Error, $"TEST COMPLETE: {report.IntegrityVerdict}");
         EmitLog(LogLevel.Info, $"Total Data Written: {report.TotalBytesWritten / (1024.0 * 1024.0 * 1024.0):F2} GB | Verified: {report.TotalBytesVerified / (1024.0 * 1024.0 * 1024.0):F2} GB");
@@ -262,12 +403,14 @@ public class DriveTestEngine
 
     private async Task WritePhaseAsync(
         string roundDir,
+        string driveRoot,
         List<TestFileInfo> filePlan,
         int roundNumber,
         List<TestFileInfo> writtenFiles,
         RoundResult roundResult,
         long overallTotalBytes,
         Stopwatch overallStopwatch,
+        TestSessionState? resumeState,
         CancellationToken ct)
     {
         const int BUFFER_SIZE = 2 * 1024 * 1024; // 2 MB buffer
@@ -281,6 +424,13 @@ public class DriveTestEngine
         long bytesSinceLastSpeedSample = 0;
         double currentSpeedMBps = 0;
 
+        // If resuming an interrupted session that was NOT paused gracefully:
+        // Clean/recreate the last written file or any truncated files
+        if (resumeState != null)
+        {
+            HandleUngracefulInterruptionRecovery(roundDir, filePlan, resumeState);
+        }
+
         for (int i = 0; i < filePlan.Count; i++)
         {
             ct.ThrowIfCancellationRequested();
@@ -288,6 +438,34 @@ public class DriveTestEngine
 
             var fileInfo = filePlan[i];
             var filePath = Path.Combine(roundDir, fileInfo.FileName);
+
+            // If file already exists and matches expected size, reuse it!
+            if (File.Exists(filePath))
+            {
+                var fi = new FileInfo(filePath);
+                if (fi.Length == fileInfo.SizeBytes)
+                {
+                    writtenFiles.Add(fileInfo);
+                    roundResult.BytesWritten += fileInfo.SizeBytes;
+                    phaseBytesProcessed += fileInfo.SizeBytes;
+                    _overallBytesProcessed += fileInfo.SizeBytes;
+                    EmitLog(LogLevel.Info, $"[RESUME] Reusing existing valid file: {fileInfo.FileName} ({fileInfo.SizeMB:F1} MB)");
+                    continue;
+                }
+                else
+                {
+                    EmitLog(LogLevel.Warning, $"[RESUME] File size mismatch ({fi.Length} vs {fileInfo.SizeBytes}). Recreating {fileInfo.FileName}...");
+                    try { File.Delete(filePath); } catch { }
+                }
+            }
+
+            // Save in-flight state to manifest
+            if (_sessionState != null)
+            {
+                _sessionState.InFlightFileName = fileInfo.FileName;
+                _sessionState.InFlightFileIndex = fileInfo.FileIndex;
+                _sessionState.Save(driveRoot, _config.TestFolderName);
+            }
 
             long fileBytesWritten = 0;
 
@@ -383,6 +561,52 @@ public class DriveTestEngine
                     roundResult.BytesWritten += fileBytesWritten;
                 }
                 break;
+            }
+        }
+    }
+
+    private void HandleUngracefulInterruptionRecovery(string roundDir, List<TestFileInfo> filePlan, TestSessionState resumeState)
+    {
+        if (resumeState.IsGracefullyPaused) return;
+
+        // If not paused gracefully: recreate the last written or in-flight file
+        if (!string.IsNullOrEmpty(resumeState.InFlightFileName))
+        {
+            var inFlightPath = Path.Combine(roundDir, resumeState.InFlightFileName);
+            if (File.Exists(inFlightPath))
+            {
+                EmitLog(LogLevel.Warning, $"[RESUME] Test was interrupted mid-write. Recreating last written file '{resumeState.InFlightFileName}' to ensure complete integrity...");
+                try { File.Delete(inFlightPath); } catch { }
+            }
+        }
+        else if (Directory.Exists(roundDir))
+        {
+            // If in-flight file name wasn't captured, identify the file with highest index on disk and recreate it
+            var tstFiles = Directory.GetFiles(roundDir, "*.tst");
+            if (tstFiles.Length > 0)
+            {
+                Array.Sort(tstFiles);
+                var lastFile = tstFiles[^1];
+                EmitLog(LogLevel.Warning, $"[RESUME] Ungraceful interruption detected. Recreating last written file '{Path.GetFileName(lastFile)}' to ensure integrity...");
+                try { File.Delete(lastFile); } catch { }
+            }
+        }
+
+        // Also clean any truncated files in this round
+        if (Directory.Exists(roundDir))
+        {
+            foreach (var planned in filePlan)
+            {
+                var path = Path.Combine(roundDir, planned.FileName);
+                if (File.Exists(path))
+                {
+                    var fi = new FileInfo(path);
+                    if (fi.Length != planned.SizeBytes)
+                    {
+                        EmitLog(LogLevel.Warning, $"[RESUME] Incomplete file '{planned.FileName}' ({fi.Length} / {planned.SizeBytes} bytes). Deleting to recreate...");
+                        try { File.Delete(path); } catch { }
+                    }
+                }
             }
         }
     }
@@ -572,6 +796,28 @@ public class DriveTestEngine
                 logAction?.Invoke($"Failed to clean test files: {ex.Message}");
             }
         });
+    }
+
+    public static TestSessionState? TryGetResumableSession(DriveTargetInfo? drive, string testFolderName = "DriveTester_IntegrityTest")
+    {
+        if (drive == null) return null;
+        var driveRoot = drive.DriveLetter;
+        if (!driveRoot.EndsWith('\\')) driveRoot += "\\";
+
+        var state = TestSessionState.TryLoad(driveRoot, testFolderName);
+        if (state != null && state.Status == SessionStatus.InProgress)
+        {
+            return state;
+        }
+        return null;
+    }
+
+    public static void DiscardSession(DriveTargetInfo? drive, string testFolderName = "DriveTester_IntegrityTest")
+    {
+        if (drive == null) return;
+        var driveRoot = drive.DriveLetter;
+        if (!driveRoot.EndsWith('\\')) driveRoot += "\\";
+        TestSessionState.Delete(driveRoot, testFolderName);
     }
 
     private void WaitIfPaused()
