@@ -9,6 +9,7 @@
         xmlns:vm="clr-namespace:DriveTester.ViewModels"
         mc:Ignorable="d"
         Title="DriveTester Pro - Storage Integrity &amp; Multi-Pass Benchmark"
+        Icon="app.ico"
         Height="740" Width="1100"
         MinHeight="580" MinWidth="900"
         WindowStartupLocation="CenterScreen"
@@ -296,7 +297,8 @@
 
             <StackPanel Orientation="Vertical">
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock Text="⚡ DriveTester Pro" FontSize="22" FontWeight="Bold" Foreground="#38bdf8" VerticalAlignment="Center" />
+                    <Image Source="app.png" Width="28" Height="28" Margin="0,0,10,0" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality" />
+                    <TextBlock Text="DriveTester Pro" FontSize="22" FontWeight="Bold" Foreground="#38bdf8" VerticalAlignment="Center" />
                     <Border Background="#1e293b" CornerRadius="4" Padding="6,2" Margin="12,0,0,0" VerticalAlignment="Center">
                         <TextBlock Text="SSD &amp; Flash Integrity Suite" FontSize="11" Foreground="#94a3b8" FontWeight="SemiBold" />
                     </Border>
@@ -468,8 +470,30 @@
             </Border>
         </Grid>
 
-        <!-- 3. Action Controls Row -->
-        <Border Grid.Row="2" Style="{StaticResource CardPanel}" Padding="12,10" Margin="0,0,0,12">
+        <!-- 3. Action Controls & Recovery Row -->
+        <StackPanel Grid.Row="2" Margin="0,0,0,12">
+            <!-- Interrupted Session Recovery Banner -->
+            <Border Visibility="{Binding HasResumableSession, Converter={StaticResource BoolToVis}}"
+                    Background="#3b1b05" BorderBrush="#f59e0b" BorderThickness="1" CornerRadius="6"
+                    Padding="12,8" Margin="0,0,0,8">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="⚠️ " FontSize="13" VerticalAlignment="Center" />
+                        <TextBlock Text="{Binding ResumableSessionBanner}" Foreground="#fef3c7" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center" />
+                        <TextBlock Text=" — Incomplete file will be recreated" Foreground="#fde68a" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <Button Command="{Binding ResumeTestCommand}" Content="↻ Resume Test" Background="#d97706" BorderBrush="#b45309" Foreground="#ffffff" FontWeight="Bold" Padding="12,4" Margin="0,0,8,0" />
+                        <Button Command="{Binding DiscardSessionCommand}" Content="Discard Session" Background="#292524" BorderBrush="#44403c" Foreground="#d6d3d1" Padding="10,4" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border Style="{StaticResource CardPanel}" Padding="12,10">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
@@ -500,6 +524,7 @@
                            VerticalAlignment="Center" HorizontalAlignment="Right" TextTrimming="CharacterEllipsis" />
             </Grid>
         </Border>
+    </StackPanel>
 
         <!-- 4. Live Telemetry & Speed Dashboard -->
         <Grid Grid.Row="3" Margin="0,0,0,12">
@@ -630,7 +655,10 @@
                     </Grid>
 
                     <ListBox Grid.Row="1" x:Name="LogListBox" ItemsSource="{Binding Logs}" Background="#0a0f1d" BorderBrush="#1e293b"
-                             ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Auto">
+                             ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Auto"
+                             VirtualizingPanel.IsVirtualizing="True"
+                             VirtualizingPanel.VirtualizationMode="Standard"
+                             VirtualizingPanel.ScrollUnit="Pixel">
                         <ListBox.ItemTemplate>
                             <DataTemplate>
                                 <StackPanel Orientation="Horizontal" Margin="0,1">

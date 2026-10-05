@@ -228,4 +228,148 @@ public class PatternAndEngineTests
             }
         }
     }
+
+    [TestMethod]
+    public void TestSessionState_SaveAndTryLoad_PreservesState()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), "DriveTester_SessionTest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempFolder);
+
+        try
+        {
+            var state = new TestSessionState
+            {
+                BaseSeed = 0xDEADBEEFCAFE1234UL,
+                PlannedRounds = 3,
+                CurrentRound = 2,
+                CurrentPhase = TestPhase.Writing,
+                InFlightFileName = "test_r02_f000005_1GB.tst",
+                InFlightFileIndex = 5,
+                IsGracefullyPaused = false,
+                SizePreset = FileSizePreset.Balanced,
+                TargetBytesPerRound = 100L * 1024 * 1024
+            };
+
+            state.Save(tempFolder, "DriveTester_IntegrityTest");
+
+            var loaded = TestSessionState.TryLoad(tempFolder, "DriveTester_IntegrityTest");
+            Assert.IsNotNull(loaded);
+            Assert.AreEqual(0xDEADBEEFCAFE1234UL, loaded.BaseSeed);
+            Assert.AreEqual(3, loaded.PlannedRounds);
+            Assert.AreEqual(2, loaded.CurrentRound);
+            Assert.AreEqual(TestPhase.Writing, loaded.CurrentPhase);
+            Assert.AreEqual("test_r02_f000005_1GB.tst", loaded.InFlightFileName);
+            Assert.IsFalse(loaded.IsGracefullyPaused);
+
+            TestSessionState.Delete(tempFolder, "DriveTester_IntegrityTest");
+            var afterDelete = TestSessionState.TryLoad(tempFolder, "DriveTester_IntegrityTest");
+            Assert.IsNull(afterDelete);
+        }
+        finally
+        {
+            if (Directory.Exists(tempFolder))
+            {
+                try { Directory.Delete(tempFolder, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task DriveTestEngine_ResumesInterruptedSession_RecreatesUngracefulFile()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), "DriveTester_ResumeTest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempFolder);
+
+        try
+        {
+            var driveInfo = new DriveInfo(Path.GetPathRoot(tempFolder)!);
+
+            var mockDrive = new DriveTargetInfo
+            {
+                DriveLetter = tempFolder,
+                ModelName = "Mock SSD For Resume",
+                BusType = "Virtual",
+                DriveFormat = "NTFS",
+                TotalSizeBytes = driveInfo.TotalSize,
+                FreeSpaceBytes = driveInfo.AvailableFreeSpace,
+                IsUsb = false
+            };
+
+            var config = new TestConfiguration
+            {
+                TargetDrive = mockDrive,
+                Rounds = 1,
+                TargetMode = CapacityTargetMode.CustomGB,
+                CustomCapacityGB = 0.005, // ~5 MB test dataset
+                SizePreset = FileSizePreset.DiverseStress,
+                FlushBuffersDirectly = false,
+                EmptyFilesAfterEachRound = false
+            };
+
+            ulong baseSeed = 0xCAFEBABE11223344UL;
+            long targetBytes = config.CalculateTargetBytes(driveInfo.AvailableFreeSpace);
+            var filePlan = FileSizePlanner.PlanFiles(targetBytes, config.SizePreset, 1);
+            Assert.IsTrue(filePlan.Count >= 2, "Test dataset should have at least 2 files.");
+
+            // Simulate partial write before crash:
+            // File 1 is fully and correctly written
+            var testDir = Path.Combine(tempFolder, config.TestFolderName);
+            var roundDir = Path.Combine(testDir, "Round_01");
+            Directory.CreateDirectory(roundDir);
+
+            var file1 = filePlan[0];
+            var file1Path = Path.Combine(roundDir, file1.FileName);
+            byte[] file1Buf = new byte[file1.SizeBytes];
+            PatternDataGenerator.FillBuffer(file1Buf, 1, file1.FileIndex, 0, baseSeed);
+            await File.WriteAllBytesAsync(file1Path, file1Buf);
+
+            // File 2 was in-flight and only partially written (truncated to 10 bytes)
+            var file2 = filePlan[1];
+            var file2Path = Path.Combine(roundDir, file2.FileName);
+            await File.WriteAllBytesAsync(file2Path, new byte[10]);
+
+            // Create interrupted session state
+            var sessionState = new TestSessionState
+            {
+                BaseSeed = baseSeed,
+                PlannedRounds = 1,
+                CurrentRound = 1,
+                CurrentPhase = TestPhase.Writing,
+                InFlightFileName = file2.FileName,
+                InFlightFileIndex = file2.FileIndex,
+                IsGracefullyPaused = false,
+                SizePreset = config.SizePreset,
+                TargetBytesPerRound = targetBytes,
+                EmptyFilesAfterEachRound = false
+            };
+            sessionState.Save(tempFolder, config.TestFolderName);
+
+            // Resume the test engine with the interrupted session state
+            var engine = new DriveTestEngine(config, baseSeed);
+            var logs = new List<string>();
+            engine.LogEmitted += entry => logs.Add(entry.Message);
+
+            var report = await engine.RunAsync(sessionState);
+
+            Assert.IsNotNull(report);
+            Assert.AreEqual(1, report.CompletedRounds);
+            Assert.AreEqual(0, report.TotalErrorsCount, "Verification must succeed after recreating the ungraceful file!");
+            Assert.IsTrue(report.IsPassed);
+
+            // Verify file 2 on disk now has the full expected planned size
+            var fi2 = new FileInfo(file2Path);
+            Assert.AreEqual(file2.SizeBytes, fi2.Length, "Truncated in-flight file should have been recreated to full planned size.");
+
+            // Verify the log contains the recreation notice
+            bool foundRecreationLog = logs.Any(l => l.Contains("Recreating") || l.Contains("recreate"));
+            Assert.IsTrue(foundRecreationLog, "Engine should log that the interrupted file was recreated.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempFolder))
+            {
+                try { Directory.Delete(tempFolder, recursive: true); } catch { }
+            }
+        }
+    }
 }

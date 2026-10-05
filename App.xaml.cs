@@ -49,16 +49,41 @@ public partial class App : Application
         Log("App.OnStartup complete");
     }
 
+    private int _consecutiveDispatcherExceptions;
+    private DateTime _lastExceptionUtc = DateTime.MinValue;
+
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         Log($"DispatcherUnhandledException: {e.Exception}");
-        MessageBox.Show(
-            $"An unexpected error occurred:\n\n{e.Exception.Message}\n\nStack Trace:\n{e.Exception.StackTrace}",
-            "DriveTester - Application Error",
-            MessageBoxButton.OK,
-            MessageBoxImage.Error);
+
+        var now = DateTime.UtcNow;
+        if ((now - _lastExceptionUtc).TotalSeconds < 2)
+        {
+            _consecutiveDispatcherExceptions++;
+        }
+        else
+        {
+            _consecutiveDispatcherExceptions = 1;
+        }
+        _lastExceptionUtc = now;
 
         e.Handled = true;
+
+        if (_consecutiveDispatcherExceptions > 3)
+        {
+            Log("Too many consecutive exceptions in layout loop; suppressing dialog.");
+            return;
+        }
+
+        try
+        {
+            MessageBox.Show(
+                $"An unexpected error occurred:\n\n{e.Exception.Message}\n\nStack Trace:\n{e.Exception.StackTrace}",
+                "DriveTester - Application Error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+        catch { }
     }
 
     private void OnCurrentDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)

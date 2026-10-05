@@ -23,12 +23,13 @@ public class TestConfiguration
             CapacityTargetMode.Fixed100GB => 100L * 1024 * 1024 * 1024,
             CapacityTargetMode.Fixed500GB => 500L * 1024 * 1024 * 1024,
             CapacityTargetMode.Fixed1000GB => 1000L * 1024 * 1024 * 1024,
-            CapacityTargetMode.CustomGB => (long)(Math.Max(0.1, CustomCapacityGB) * 1024 * 1024 * 1024),
+            CapacityTargetMode.CustomGB => (long)(Math.Max(0.001, CustomCapacityGB) * 1024 * 1024 * 1024),
             _ => (long)(availableFreeBytes * 0.95)
         };
 
-        // Don't exceed available free space with 100MB safety buffer
-        long maxSafe = Math.Max(0, availableFreeBytes - 100L * 1024 * 1024);
+        // Don't exceed available free space with safety buffer
+        long safetyBuffer = Math.Min(100L * 1024 * 1024, (long)(availableFreeBytes * 0.05));
+        long maxSafe = Math.Max(0, availableFreeBytes - safetyBuffer);
         return Math.Min(target, maxSafe);
     }
 }

@@ -1,5 +1,6 @@
 using System.Collections.Specialized;
 using System.Windows;
+using System.Windows.Threading;
 using DriveTester.ViewModels;
 
 namespace DriveTester;
@@ -10,6 +11,7 @@ namespace DriveTester;
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _vm;
+    private bool _scrollPending;
 
     public MainWindow()
     {
@@ -23,15 +25,27 @@ public partial class MainWindow : Window
             DataContext = _vm;
             App.Log("MainWindow.DataContext set");
 
-            // Auto-scroll log listbox
+            // Auto-scroll log listbox safely via debounced idle dispatch
             ((INotifyCollectionChanged)_vm.Logs).CollectionChanged += (_, e) =>
             {
-                if (e.Action == NotifyCollectionChangedAction.Add && AutoScrollCheckbox.IsChecked == true)
+                if (e.Action == NotifyCollectionChangedAction.Add && AutoScrollCheckbox.IsChecked == true && !_scrollPending)
                 {
-                    if (LogListBox.Items.Count > 0)
+                    _scrollPending = true;
+                    Dispatcher.InvokeAsync(() =>
                     {
-                        LogListBox.ScrollIntoView(LogListBox.Items[^1]);
-                    }
+                        _scrollPending = false;
+                        try
+                        {
+                            if (LogListBox.Items.Count > 0)
+                            {
+                                LogListBox.ScrollIntoView(LogListBox.Items[^1]);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            App.Log($"Log auto-scroll handled: {ex.Message}");
+                        }
+                    }, DispatcherPriority.Background);
                 }
             };
 
@@ -42,7 +56,7 @@ public partial class MainWindow : Window
                 {
                     LiveSpeedGraph.SpeedPoints = _vm.SpeedHistory;
                     LiveSpeedGraph.Redraw();
-                });
+                }, DispatcherPriority.Background);
             };
 
             Closing += (s, e) => App.Log($"MainWindow Closing event: Cancel={e.Cancel}");
