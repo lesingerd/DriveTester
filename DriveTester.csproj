@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="DriveTester.Tests\**" />
+    <EmbeddedResource Remove="DriveTester.Tests\**" />
+    <None Remove="DriveTester.Tests\**" />
+    <Page Remove="DriveTester.Tests\**" />
+  </ItemGroup>
+
+</Project>
