@@ -24,7 +24,7 @@ public class TestSessionState
     public FileSizePreset SizePreset { get; set; }
     public bool FlushBuffersDirectly { get; set; }
     public bool StopOnFirstError { get; set; }
-    public bool EmptyFilesAfterEachRound { get; set; }
+    public bool EmptyFilesAfterEachRound { get; set; } = true;
     public long TargetBytesPerRound { get; set; }
 
     // Execution progress

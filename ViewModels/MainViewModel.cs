@@ -444,9 +444,9 @@ public class MainViewModel : ViewModelBase
                 TargetMode = resumeState.TargetMode,
                 CustomCapacityGB = resumeState.CustomCapacityGB,
                 SizePreset = resumeState.SizePreset,
-                FlushBuffersDirectly = resumeState.FlushBuffersDirectly,
-                StopOnFirstError = resumeState.StopOnFirstError,
-                EmptyFilesAfterEachRound = resumeState.EmptyFilesAfterEachRound
+                FlushBuffersDirectly = FlushBuffersDirectly,
+                StopOnFirstError = StopOnFirstError,
+                EmptyFilesAfterEachRound = EmptyFilesAfterEachRound
             };
 
             foreach (var prevRound in resumeState.CompletedRoundsResults)

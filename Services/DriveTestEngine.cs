@@ -165,20 +165,21 @@ public class DriveTestEngine
 
                 EmitLog(LogLevel.Info, $">>> STARTING ROUND {r} of {_config.Rounds} <<<");
 
+                // Always ensure any completed previous rounds (e.g. Round_01 before Round 2) are cleaned up
+                // to free drive space for the upcoming round
+                await CleanPreviousRoundsAsync(testRootDir, r, ct);
+
                 var roundResult = new RoundResult { RoundNumber = r };
                 var roundDir = Path.Combine(testRootDir, $"Round_{r:D2}");
                 Directory.CreateDirectory(roundDir);
 
-                long currentRoundTargetBytes = targetBytesPerRound;
-                if (currentRoundTargetBytes <= 0)
-                {
-                    driveInfo = new DriveInfo(driveRoot);
-                    currentRoundTargetBytes = _config.CalculateTargetBytes(driveInfo.AvailableFreeSpace);
-                }
+                // Refresh free space from OS after cleaning previous rounds
+                driveInfo = new DriveInfo(driveRoot);
+                long currentRoundTargetBytes = _config.CalculateTargetBytes(driveInfo.AvailableFreeSpace);
 
                 if (currentRoundTargetBytes <= 0)
                 {
-                    EmitLog(LogLevel.Error, $"Not enough free disk space on {driveRoot} to execute Round {r}.");
+                    EmitLog(LogLevel.Error, $"Not enough free disk space on {driveRoot} to execute Round {r} (Available: {driveInfo.AvailableFreeSpace / (1024.0 * 1024.0 * 1024.0):F2} GB).");
                     break;
                 }
 
@@ -298,7 +299,18 @@ public class DriveTestEngine
                 // ==========================================
                 // PHASE 3: EMPTYING / CLEANUP PHASE
                 // ==========================================
-                if (_config.EmptyFilesAfterEachRound)
+                bool shouldEmpty = _config.EmptyFilesAfterEachRound;
+                if (!shouldEmpty && r < _config.Rounds)
+                {
+                    var driveCheck = new DriveInfo(driveRoot);
+                    if (driveCheck.AvailableFreeSpace < currentRoundTargetBytes)
+                    {
+                        EmitLog(LogLevel.Warning, $"Round {r}: Drive free space ({driveCheck.AvailableFreeSpace / (1024.0 * 1024.0 * 1024.0):F2} GB) is insufficient for Round {r + 1}. Emptying Round {r} files so test can continue.");
+                        shouldEmpty = true;
+                    }
+                }
+
+                if (shouldEmpty)
                 {
                     EmitLog(LogLevel.Info, $"Round {r}: [PHASE 3/3: EMPTYING TEST FILES FROM DRIVE]");
                     _sessionState.CurrentRound = r;
@@ -306,7 +318,9 @@ public class DriveTestEngine
                     _sessionState.Save(driveRoot, _config.TestFolderName);
 
                     await EmptyPhaseAsync(roundDir, r, ct);
-                    EmitLog(LogLevel.Info, $"Round {r}: Drive emptied. Space reclaimed for next cycle.");
+
+                    driveInfo = new DriveInfo(driveRoot);
+                    EmitLog(LogLevel.Success, $"Round {r}: Drive emptied. Available free space: {driveInfo.AvailableFreeSpace / (1024.0 * 1024.0 * 1024.0):F1} GB reclaimed for next cycle.");
                 }
                 else
                 {
@@ -754,18 +768,122 @@ public class DriveTestEngine
             {
                 if (Directory.Exists(roundDir))
                 {
-                    var files = Directory.GetFiles(roundDir, "*.tst");
+                    var files = Directory.GetFiles(roundDir, "*.*", SearchOption.AllDirectories);
+                    EmitLog(LogLevel.Info, $"Round {roundNumber}: Deleting {files.Length} test files to reclaim drive space...");
+                    int deletedCount = 0;
+
                     foreach (var file in files)
                     {
                         ct.ThrowIfCancellationRequested();
-                        File.Delete(file);
+                        try
+                        {
+                            File.SetAttributes(file, FileAttributes.Normal);
+                            File.Delete(file);
+                            deletedCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            EmitLog(LogLevel.Warning, $"Could not delete {Path.GetFileName(file)}: {ex.Message}");
+                        }
+
+                        if (deletedCount % 20 == 0 || deletedCount == files.Length)
+                        {
+                            ProgressUpdated?.Invoke(new TestProgressUpdate
+                            {
+                                CurrentRound = roundNumber,
+                                TotalRounds = _config.Rounds,
+                                CurrentPhase = TestPhase.Emptying,
+                                PhaseBytesProcessed = deletedCount,
+                                PhaseTotalBytes = Math.Max(1, files.Length),
+                                StatusMessage = $"Emptying Round {roundNumber} ({deletedCount}/{files.Length} files deleted)"
+                            });
+                        }
                     }
-                    Directory.Delete(roundDir, recursive: true);
+
+                    for (int attempt = 1; attempt <= 5; attempt++)
+                    {
+                        try
+                        {
+                            if (Directory.Exists(roundDir))
+                            {
+                                Directory.Delete(roundDir, recursive: true);
+                            }
+                            break;
+                        }
+                        catch when (attempt < 5)
+                        {
+                            Thread.Sleep(200);
+                        }
+                    }
                 }
             }
             catch (Exception ex)
             {
                 EmitLog(LogLevel.Warning, $"Could not delete directory {roundDir}: {ex.Message}");
+            }
+        }, ct);
+    }
+
+    private async Task CleanPreviousRoundsAsync(string testRootDir, int currentRound, CancellationToken ct)
+    {
+        await Task.Run(() =>
+        {
+            try
+            {
+                if (!Directory.Exists(testRootDir)) return;
+
+                var roundDirs = Directory.GetDirectories(testRootDir, "Round_*");
+                foreach (var dir in roundDirs)
+                {
+                    var dirName = Path.GetFileName(dir);
+                    if (dirName.StartsWith("Round_", StringComparison.OrdinalIgnoreCase) &&
+                        int.TryParse(dirName.AsSpan("Round_".Length), out int roundNum) &&
+                        roundNum < currentRound)
+                    {
+                        EmitLog(LogLevel.Warning, $"[SPACE RECLAIM] Found uncleaned files from Round {roundNum} ({dirName}). Deleting to reclaim space for Round {currentRound}...");
+
+                        try
+                        {
+                            var files = Directory.GetFiles(dir, "*.*", SearchOption.AllDirectories);
+                            foreach (var f in files)
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                try
+                                {
+                                    File.SetAttributes(f, FileAttributes.Normal);
+                                    File.Delete(f);
+                                }
+                                catch { }
+                            }
+
+                            for (int attempt = 1; attempt <= 5; attempt++)
+                            {
+                                try
+                                {
+                                    if (Directory.Exists(dir))
+                                    {
+                                        Directory.Delete(dir, recursive: true);
+                                    }
+                                    break;
+                                }
+                                catch when (attempt < 5)
+                                {
+                                    Thread.Sleep(200);
+                                }
+                            }
+
+                            EmitLog(LogLevel.Success, $"[SPACE RECLAIM] Successfully removed {dirName}. Storage reclaimed for Round {currentRound}.");
+                        }
+                        catch (Exception ex)
+                        {
+                            EmitLog(LogLevel.Warning, $"Could not completely delete {dirName}: {ex.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                EmitLog(LogLevel.Warning, $"Error during previous round cleanup: {ex.Message}");
             }
         }, ct);
     }
@@ -861,6 +979,7 @@ public class DriveTestEngine
                                                 IsGracefullyPaused = false, // Ungraceful crash: recreate last file
                                                 SizePreset = FileSizePreset.Balanced,
                                                 TargetBytesPerRound = tstFiles.Sum(f => new FileInfo(f).Length),
+                                                EmptyFilesAfterEachRound = true,
                                                 Status = SessionStatus.InProgress
                                             };
 

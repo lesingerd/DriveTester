@@ -424,4 +424,62 @@ public class PatternAndEngineTests
             }
         }
     }
+
+    [TestMethod]
+    public async Task DriveTestEngine_MultiRound_CleansPreviousRoundsBeforeNextRound()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), "DriveTester_MultiRoundCleanTest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempFolder);
+
+        try
+        {
+            var driveInfo = new DriveInfo(Path.GetPathRoot(tempFolder)!);
+
+            var mockDrive = new DriveTargetInfo
+            {
+                DriveLetter = tempFolder,
+                ModelName = "Mock SSD Multi-Round",
+                BusType = "Virtual",
+                DriveFormat = "NTFS",
+                TotalSizeBytes = driveInfo.TotalSize,
+                FreeSpaceBytes = driveInfo.AvailableFreeSpace,
+                IsUsb = false
+            };
+
+            var config = new TestConfiguration
+            {
+                TargetDrive = mockDrive,
+                Rounds = 2,
+                TargetMode = CapacityTargetMode.CustomGB,
+                CustomCapacityGB = 0.005, // 5 MB per round
+                SizePreset = FileSizePreset.DiverseStress,
+                FlushBuffersDirectly = false,
+                EmptyFilesAfterEachRound = true
+            };
+
+            var engine = new DriveTestEngine(config);
+            var roundResults = new List<RoundResult>();
+            engine.RoundCompleted += r => roundResults.Add(r);
+
+            var report = await engine.RunAsync();
+
+            Assert.IsNotNull(report);
+            Assert.AreEqual(2, report.CompletedRounds);
+            Assert.AreEqual(0, report.TotalErrorsCount);
+            Assert.IsTrue(report.IsPassed);
+            Assert.AreEqual(2, roundResults.Count);
+
+            // Verify Round_01 directory was cleaned up
+            var testDir = Path.Combine(tempFolder, config.TestFolderName);
+            var round1Dir = Path.Combine(testDir, "Round_01");
+            Assert.IsFalse(Directory.Exists(round1Dir), "Round_01 should be completely removed after Round 1 or before Round 2.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempFolder))
+            {
+                try { Directory.Delete(tempFolder, recursive: true); } catch { }
+            }
+        }
+    }
 }
