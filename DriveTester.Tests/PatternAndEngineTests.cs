@@ -372,4 +372,56 @@ public class PatternAndEngineTests
             }
         }
     }
+
+    [TestMethod]
+    public void DriveTestEngine_TryGetResumableSession_RecoversFromRawFileHeaders()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), "DriveTester_RawHeaderTest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempFolder);
+
+        try
+        {
+            var mockDrive = new DriveTargetInfo
+            {
+                DriveLetter = tempFolder,
+                ModelName = "Mock Drive",
+                TotalSizeBytes = 100L * 1024 * 1024 * 1024,
+                FreeSpaceBytes = 50L * 1024 * 1024 * 1024
+            };
+
+            var testDir = Path.Combine(tempFolder, "DriveTester_IntegrityTest");
+            var roundDir = Path.Combine(testDir, "Round_01");
+            Directory.CreateDirectory(roundDir);
+
+            // Write a test file with genuine header, but NO session_state.json
+            ulong expectedBaseSeed = 0xFEEDBEEF01020304UL;
+            int round = 1;
+            int fileIndex = 3;
+            var filePath = Path.Combine(roundDir, "test_r01_f00003_16MB.tst");
+            byte[] fileBuf = new byte[64 * 1024];
+            PatternDataGenerator.FillBuffer(fileBuf, round, fileIndex, 0, expectedBaseSeed);
+            File.WriteAllBytes(filePath, fileBuf);
+
+            // Verify session_state.json does NOT exist yet
+            Assert.IsFalse(File.Exists(Path.Combine(testDir, "session_state.json")));
+
+            // TryGetResumableSession should discover and reconstruct the session from file header
+            var recoveredSession = DriveTestEngine.TryGetResumableSession(mockDrive);
+            Assert.IsNotNull(recoveredSession);
+            Assert.AreEqual(expectedBaseSeed, recoveredSession.BaseSeed);
+            Assert.AreEqual(1, recoveredSession.CurrentRound);
+            Assert.AreEqual(TestPhase.Writing, recoveredSession.CurrentPhase);
+            Assert.IsFalse(recoveredSession.IsGracefullyPaused);
+
+            // It should also have generated session_state.json
+            Assert.IsTrue(File.Exists(Path.Combine(testDir, "session_state.json")));
+        }
+        finally
+        {
+            if (Directory.Exists(tempFolder))
+            {
+                try { Directory.Delete(tempFolder, recursive: true); } catch { }
+            }
+        }
+    }
 }

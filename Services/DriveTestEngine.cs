@@ -809,6 +809,74 @@ public class DriveTestEngine
         {
             return state;
         }
+
+        // If session_state.json was missing (e.g. from an earlier build that crashed before state saving),
+        // inspect existing test files on the drive to reconstruct the session state directly from file headers.
+        try
+        {
+            var testRootDir = Path.Combine(driveRoot, testFolderName);
+            if (Directory.Exists(testRootDir))
+            {
+                var roundDirs = Directory.GetDirectories(testRootDir, "Round_*");
+                Array.Sort(roundDirs);
+                var activeRoundDir = roundDirs.Length > 0 ? roundDirs[^1] : null;
+
+                if (activeRoundDir != null)
+                {
+                    var tstFiles = Directory.GetFiles(activeRoundDir, "*.tst");
+                    if (tstFiles.Length > 0)
+                    {
+                        Array.Sort(tstFiles);
+
+                        foreach (var file in tstFiles)
+                        {
+                            var fi = new FileInfo(file);
+                            if (fi.Length >= PatternDataGenerator.HEADER_SIZE)
+                            {
+                                byte[] header = new byte[PatternDataGenerator.HEADER_SIZE];
+                                using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                                {
+                                    int read = fs.Read(header, 0, header.Length);
+                                    if (read == header.Length)
+                                    {
+                                        ulong magic = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(0, 8));
+                                        if (magic == PatternDataGenerator.MAGIC_SIGNATURE)
+                                        {
+                                            int round = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));
+                                            int fileIdx = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(12, 4));
+                                            ulong blockSeed = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(32, 8));
+                                            ulong recoveredBaseSeed = blockSeed ^ (ulong)round ^ ((ulong)fileIdx << 16);
+
+                                            var lastFile = tstFiles[^1];
+                                            var lastFileName = Path.GetFileName(lastFile);
+
+                                            var reconstructed = new TestSessionState
+                                            {
+                                                BaseSeed = recoveredBaseSeed,
+                                                PlannedRounds = Math.Max(2, round),
+                                                CurrentRound = round,
+                                                CurrentPhase = TestPhase.Writing,
+                                                InFlightFileName = lastFileName,
+                                                InFlightFileIndex = tstFiles.Length,
+                                                IsGracefullyPaused = false, // Ungraceful crash: recreate last file
+                                                SizePreset = FileSizePreset.Balanced,
+                                                TargetBytesPerRound = tstFiles.Sum(f => new FileInfo(f).Length),
+                                                Status = SessionStatus.InProgress
+                                            };
+
+                                            reconstructed.Save(driveRoot, testFolderName);
+                                            return reconstructed;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+
         return null;
     }
 
