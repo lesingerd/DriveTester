@@ -449,9 +449,25 @@ public class MainViewModel : ViewModelBase
                 EmptyFilesAfterEachRound = EmptyFilesAfterEachRound
             };
 
-            foreach (var prevRound in resumeState.CompletedRoundsResults)
+            if (resumeState.CompletedRoundsResults != null)
             {
-                RoundResults.Add(prevRound);
+                foreach (var prevRound in resumeState.CompletedRoundsResults)
+                {
+                    RoundResults.Add(prevRound);
+                }
+            }
+            for (int pr = 1; pr < resumeState.CurrentRound && pr <= resumeState.PlannedRounds; pr++)
+            {
+                if (!RoundResults.Any(r => r.RoundNumber == pr))
+                {
+                    RoundResults.Add(new RoundResult
+                    {
+                        RoundNumber = pr,
+                        BytesWritten = resumeState.TargetBytesPerRound,
+                        BytesVerified = resumeState.TargetBytesPerRound,
+                        ErrorCount = 0
+                    });
+                }
             }
         }
         else

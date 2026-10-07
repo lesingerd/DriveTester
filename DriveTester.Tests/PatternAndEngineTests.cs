@@ -482,4 +482,168 @@ public class PatternAndEngineTests
             }
         }
     }
+
+    [TestMethod]
+    public async Task DriveTestEngine_ResumeAtRound2Of2_CompletesSuccessfullyWithPassedVerdict()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), "DriveTester_ResumeR2Test_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempFolder);
+
+        try
+        {
+            var driveInfo = new DriveInfo(Path.GetPathRoot(tempFolder)!);
+            var mockDrive = new DriveTargetInfo
+            {
+                DriveLetter = tempFolder,
+                ModelName = "Mock SSD Resume R2",
+                BusType = "Virtual",
+                DriveFormat = "NTFS",
+                TotalSizeBytes = driveInfo.TotalSize,
+                FreeSpaceBytes = driveInfo.AvailableFreeSpace,
+                IsUsb = false
+            };
+
+            var config = new TestConfiguration
+            {
+                TargetDrive = mockDrive,
+                Rounds = 2,
+                TargetMode = CapacityTargetMode.CustomGB,
+                CustomCapacityGB = 0.002, // 2 MB per round
+                SizePreset = FileSizePreset.DiverseStress,
+                FlushBuffersDirectly = false,
+                EmptyFilesAfterEachRound = true
+            };
+
+            var testDir = Path.Combine(tempFolder, config.TestFolderName);
+            Directory.CreateDirectory(testDir);
+
+            // Simulate session state saved after Round 1 completed, now resuming Round 2
+            var resumeState = new TestSessionState
+            {
+                BaseSeed = 0xABCD1234EF567890UL,
+                PlannedRounds = 2,
+                CurrentRound = 2,
+                CurrentPhase = TestPhase.Writing,
+                TargetMode = CapacityTargetMode.CustomGB,
+                CustomCapacityGB = 0.002,
+                SizePreset = FileSizePreset.DiverseStress,
+                TargetBytesPerRound = 2 * 1024 * 1024,
+                EmptyFilesAfterEachRound = true,
+                Status = SessionStatus.InProgress
+            };
+            resumeState.Save(tempFolder, config.TestFolderName);
+
+            var engine = new DriveTestEngine(config, resumeState.BaseSeed);
+            var report = await engine.RunAsync(resumeState);
+
+            Assert.IsNotNull(report);
+            Assert.AreEqual(2, report.PlannedRounds);
+            Assert.AreEqual(2, report.CompletedRounds);
+            Assert.AreEqual(0, report.TotalErrorsCount);
+            Assert.IsTrue(report.IsPassed);
+            StringAssert.Contains(report.IntegrityVerdict, "GENUINE / HEALTHY");
+
+            // Session state file should have been deleted upon clean completion
+            Assert.IsFalse(File.Exists(Path.Combine(testDir, "session_state.json")),
+                "session_state.json should be deleted after successful completion of all rounds.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempFolder))
+            {
+                try { Directory.Delete(tempFolder, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [TestMethod]
+    public void DriveTestEngine_TryGetResumableSession_DiscardsCompletedOrOverRoundSession()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), "DriveTester_DiscardOverRound_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempFolder);
+
+        try
+        {
+            var mockDrive = new DriveTargetInfo
+            {
+                DriveLetter = tempFolder,
+                ModelName = "Mock Drive",
+                BusType = "Virtual",
+                DriveFormat = "NTFS"
+            };
+
+            var testFolderName = "DriveTester_IntegrityTest";
+            var testDir = Path.Combine(tempFolder, testFolderName);
+            Directory.CreateDirectory(testDir);
+
+            // Case 1: Session state has CurrentRound (3) > PlannedRounds (2)
+            var overRoundState = new TestSessionState
+            {
+                PlannedRounds = 2,
+                CurrentRound = 3,
+                Status = SessionStatus.InProgress
+            };
+            overRoundState.Save(tempFolder, testFolderName);
+            Assert.IsTrue(File.Exists(Path.Combine(testDir, "session_state.json")));
+
+            var session1 = DriveTestEngine.TryGetResumableSession(mockDrive, testFolderName);
+            Assert.IsNull(session1, "Should return null for session where CurrentRound > PlannedRounds.");
+            Assert.IsFalse(File.Exists(Path.Combine(testDir, "session_state.json")),
+                "Stale session_state.json should be deleted from disk.");
+
+            // Case 2: Session state is marked Completed
+            var completedState = new TestSessionState
+            {
+                PlannedRounds = 2,
+                CurrentRound = 2,
+                Status = SessionStatus.Completed
+            };
+            completedState.Save(tempFolder, testFolderName);
+            Assert.IsTrue(File.Exists(Path.Combine(testDir, "session_state.json")));
+
+            var session2 = DriveTestEngine.TryGetResumableSession(mockDrive, testFolderName);
+            Assert.IsNull(session2, "Should return null for completed session.");
+            Assert.IsFalse(File.Exists(Path.Combine(testDir, "session_state.json")),
+                "Completed session_state.json should be deleted from disk.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempFolder))
+            {
+                try { Directory.Delete(tempFolder, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [TestMethod]
+    public void FinalTestReport_VerdictLogic_HandlesCompletedAndPartialRounds()
+    {
+        var passReport = new FinalTestReport
+        {
+            PlannedRounds = 2,
+            CompletedRounds = 2,
+            TotalErrorsCount = 0
+        };
+        Assert.IsTrue(passReport.IsPassed);
+        StringAssert.Contains(passReport.IntegrityVerdict, "GENUINE / HEALTHY");
+
+        var partialReport = new FinalTestReport
+        {
+            PlannedRounds = 2,
+            CompletedRounds = 1,
+            TotalErrorsCount = 0
+        };
+        Assert.IsFalse(partialReport.IsPassed);
+        StringAssert.Contains(partialReport.IntegrityVerdict, "PARTIAL PASS");
+        StringAssert.Contains(partialReport.IntegrityVerdict, "1 of 2 rounds completed with 0 errors");
+
+        var failReport = new FinalTestReport
+        {
+            PlannedRounds = 2,
+            CompletedRounds = 2,
+            TotalErrorsCount = 3
+        };
+        Assert.IsFalse(failReport.IsPassed);
+        StringAssert.Contains(failReport.IntegrityVerdict, "FAIL: Data corruption detected");
+    }
 }

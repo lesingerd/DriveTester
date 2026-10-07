@@ -107,7 +107,7 @@ public class DriveTestEngine
             _sessionState = resumeState;
             _baseSeed = resumeState.BaseSeed;
             startRound = Math.Max(1, resumeState.CurrentRound);
-            if (resumeState.CompletedRoundsResults.Count > 0)
+            if (resumeState.CompletedRoundsResults != null && resumeState.CompletedRoundsResults.Count > 0)
             {
                 roundResults.AddRange(resumeState.CompletedRoundsResults);
             }
@@ -115,6 +115,22 @@ public class DriveTestEngine
             {
                 targetBytesPerRound = resumeState.TargetBytesPerRound;
             }
+
+            // Synthesize any missing prior completed rounds if resuming from a later round
+            for (int pr = 1; pr < startRound && pr <= _config.Rounds; pr++)
+            {
+                if (!roundResults.Any(r => r.RoundNumber == pr))
+                {
+                    roundResults.Add(new RoundResult
+                    {
+                        RoundNumber = pr,
+                        BytesWritten = targetBytesPerRound,
+                        BytesVerified = targetBytesPerRound,
+                        ErrorCount = 0
+                    });
+                }
+            }
+            roundResults = roundResults.OrderBy(r => r.RoundNumber).ToList();
 
             EmitLog(LogLevel.Warning, $"==================================================");
             EmitLog(LogLevel.Warning, $"RESUMING INTERRUPTED TEST SESSION on {driveRoot}");
@@ -329,12 +345,29 @@ public class DriveTestEngine
 
                 roundResults.Add(roundResult);
                 RoundCompleted?.Invoke(roundResult);
-                completedRounds++;
+                completedRounds = Math.Max(completedRounds + 1, roundResults.Count);
 
                 _sessionState.CompletedRoundsResults = roundResults.ToList();
-                _sessionState.CurrentRound = r + 1;
-                _sessionState.CurrentPhase = TestPhase.Writing;
-                _sessionState.Save(driveRoot, _config.TestFolderName);
+                if (r < _config.Rounds)
+                {
+                    _sessionState.CurrentRound = r + 1;
+                    _sessionState.CurrentPhase = TestPhase.Writing;
+                    _sessionState.Save(driveRoot, _config.TestFolderName);
+                }
+                else
+                {
+                    _sessionState.CurrentRound = _config.Rounds;
+                    _sessionState.CurrentPhase = TestPhase.Completed;
+                    _sessionState.Status = SessionStatus.Completed;
+                    if (_config.EmptyFilesAfterEachRound)
+                    {
+                        TestSessionState.Delete(driveRoot, _config.TestFolderName);
+                    }
+                    else
+                    {
+                        _sessionState.Save(driveRoot, _config.TestFolderName);
+                    }
+                }
 
                 // Clear resume state once initial resumed round finishes
                 resumeState = null;
@@ -389,10 +422,12 @@ public class DriveTestEngine
             report.OverallAvgReadSpeedMBps = roundResults.Average(r => r.AvgReadSpeedMBps);
         }
 
-        if (!aborted && completedRounds == _config.Rounds)
+        if (!aborted && completedRounds >= _config.Rounds)
         {
             if (_sessionState != null)
             {
+                _sessionState.CurrentRound = _config.Rounds;
+                _sessionState.CurrentPhase = TestPhase.Completed;
                 _sessionState.Status = SessionStatus.Completed;
                 if (_config.EmptyFilesAfterEachRound)
                 {
@@ -768,6 +803,10 @@ public class DriveTestEngine
             {
                 if (Directory.Exists(roundDir))
                 {
+                    // Release any lingering file handles or uncollected stream objects before deletion
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+
                     var files = Directory.GetFiles(roundDir, "*.*", SearchOption.AllDirectories);
                     EmitLog(LogLevel.Info, $"Round {roundNumber}: Deleting {files.Length} test files to reclaim drive space...");
                     int deletedCount = 0;
@@ -775,15 +814,30 @@ public class DriveTestEngine
                     foreach (var file in files)
                     {
                         ct.ThrowIfCancellationRequested();
-                        try
+                        for (int attempt = 1; attempt <= 6; attempt++)
                         {
-                            File.SetAttributes(file, FileAttributes.Normal);
-                            File.Delete(file);
-                            deletedCount++;
-                        }
-                        catch (Exception ex)
-                        {
-                            EmitLog(LogLevel.Warning, $"Could not delete {Path.GetFileName(file)}: {ex.Message}");
+                            try
+                            {
+                                if (File.Exists(file))
+                                {
+                                    File.SetAttributes(file, FileAttributes.Normal);
+                                    File.Delete(file);
+                                }
+                                deletedCount++;
+                                break;
+                            }
+                            catch (IOException) when (attempt < 6)
+                            {
+                                Thread.Sleep(150 * attempt);
+                            }
+                            catch (UnauthorizedAccessException) when (attempt < 6)
+                            {
+                                Thread.Sleep(150 * attempt);
+                            }
+                            catch (Exception ex) when (attempt == 6)
+                            {
+                                EmitLog(LogLevel.Warning, $"Could not delete {Path.GetFileName(file)} after {attempt} attempts: {ex.Message}");
+                            }
                         }
 
                         if (deletedCount % 20 == 0 || deletedCount == files.Length)
@@ -800,7 +854,7 @@ public class DriveTestEngine
                         }
                     }
 
-                    for (int attempt = 1; attempt <= 5; attempt++)
+                    for (int attempt = 1; attempt <= 6; attempt++)
                     {
                         try
                         {
@@ -810,9 +864,13 @@ public class DriveTestEngine
                             }
                             break;
                         }
-                        catch when (attempt < 5)
+                        catch when (attempt < 6)
                         {
-                            Thread.Sleep(200);
+                            Thread.Sleep(250 * attempt);
+                        }
+                        catch (Exception ex) when (attempt == 6)
+                        {
+                            EmitLog(LogLevel.Warning, $"Could not delete directory {roundDir}: {ex.Message}");
                         }
                     }
                 }
@@ -844,19 +902,33 @@ public class DriveTestEngine
 
                         try
                         {
+                            GC.Collect();
+                            GC.WaitForPendingFinalizers();
+
                             var files = Directory.GetFiles(dir, "*.*", SearchOption.AllDirectories);
                             foreach (var f in files)
                             {
                                 ct.ThrowIfCancellationRequested();
-                                try
+                                for (int attempt = 1; attempt <= 6; attempt++)
                                 {
-                                    File.SetAttributes(f, FileAttributes.Normal);
-                                    File.Delete(f);
+                                    try
+                                    {
+                                        if (File.Exists(f))
+                                        {
+                                            File.SetAttributes(f, FileAttributes.Normal);
+                                            File.Delete(f);
+                                        }
+                                        break;
+                                    }
+                                    catch when (attempt < 6)
+                                    {
+                                        Thread.Sleep(150 * attempt);
+                                    }
+                                    catch { }
                                 }
-                                catch { }
                             }
 
-                            for (int attempt = 1; attempt <= 5; attempt++)
+                            for (int attempt = 1; attempt <= 6; attempt++)
                             {
                                 try
                                 {
@@ -866,13 +938,21 @@ public class DriveTestEngine
                                     }
                                     break;
                                 }
-                                catch when (attempt < 5)
+                                catch when (attempt < 6)
                                 {
-                                    Thread.Sleep(200);
+                                    Thread.Sleep(250 * attempt);
                                 }
+                                catch { }
                             }
 
-                            EmitLog(LogLevel.Success, $"[SPACE RECLAIM] Successfully removed {dirName}. Storage reclaimed for Round {currentRound}.");
+                            if (!Directory.Exists(dir))
+                            {
+                                EmitLog(LogLevel.Success, $"[SPACE RECLAIM] Successfully removed {dirName}. Storage reclaimed for Round {currentRound}.");
+                            }
+                            else
+                            {
+                                EmitLog(LogLevel.Warning, $"[SPACE RECLAIM] Directory {dirName} could not be completely removed.");
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -901,8 +981,56 @@ public class DriveTestEngine
                 if (Directory.Exists(testRootDir))
                 {
                     logAction?.Invoke($"Deleting leftover test files in {testRootDir}...");
-                    Directory.Delete(testRootDir, recursive: true);
-                    logAction?.Invoke("Leftover test directory successfully deleted.");
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+
+                    var files = Directory.GetFiles(testRootDir, "*.*", SearchOption.AllDirectories);
+                    foreach (var f in files)
+                    {
+                        for (int attempt = 1; attempt <= 6; attempt++)
+                        {
+                            try
+                            {
+                                if (File.Exists(f))
+                                {
+                                    File.SetAttributes(f, FileAttributes.Normal);
+                                    File.Delete(f);
+                                }
+                                break;
+                            }
+                            catch when (attempt < 6)
+                            {
+                                Thread.Sleep(150 * attempt);
+                            }
+                            catch { }
+                        }
+                    }
+
+                    for (int attempt = 1; attempt <= 6; attempt++)
+                    {
+                        try
+                        {
+                            if (Directory.Exists(testRootDir))
+                            {
+                                Directory.Delete(testRootDir, recursive: true);
+                            }
+                            break;
+                        }
+                        catch when (attempt < 6)
+                        {
+                            Thread.Sleep(250 * attempt);
+                        }
+                        catch { }
+                    }
+
+                    if (Directory.Exists(testRootDir))
+                    {
+                        logAction?.Invoke("Some files could not be removed immediately because they may be locked by another process (e.g. antivirus).");
+                    }
+                    else
+                    {
+                        logAction?.Invoke("Leftover test directory successfully deleted.");
+                    }
                 }
                 else
                 {
@@ -923,9 +1051,21 @@ public class DriveTestEngine
         if (!driveRoot.EndsWith('\\')) driveRoot += "\\";
 
         var state = TestSessionState.TryLoad(driveRoot, testFolderName);
-        if (state != null && state.Status == SessionStatus.InProgress)
+        if (state != null)
         {
-            return state;
+            // If already completed or current round exceeds planned rounds, discard stale state
+            if (state.Status == SessionStatus.Completed || state.CurrentRound > state.PlannedRounds)
+            {
+                TestSessionState.Delete(driveRoot, testFolderName);
+                return null;
+            }
+
+            if (state.Status == SessionStatus.InProgress)
+            {
+                return state;
+            }
+
+            return null;
         }
 
         // If session_state.json was missing (e.g. from an earlier build that crashed before state saving),

@@ -22,7 +22,7 @@ public class FinalTestReport
     public List<RoundResult> Rounds { get; set; } = new();
     public List<string> CriticalErrors { get; set; } = new();
 
-    public bool IsPassed => TotalErrorsCount == 0 && CompletedRounds == PlannedRounds && CompletedRounds > 0;
+    public bool IsPassed => TotalErrorsCount == 0 && CompletedRounds >= PlannedRounds && CompletedRounds > 0;
 
     public string IntegrityVerdict
     {
@@ -37,6 +37,11 @@ public class FinalTestReport
             {
                 // Check if errors indicate fake drive
                 return "FAIL: Data corruption detected! Possible fake capacity (looping firmware) or defective flash memory.";
+            }
+
+            if (CompletedRounds > 0 && CompletedRounds < PlannedRounds)
+            {
+                return $"PARTIAL PASS: {CompletedRounds} of {PlannedRounds} rounds completed with 0 errors, but test was interrupted before all rounds finished.";
             }
 
             return "INCOMPLETE: Test was interrupted or aborted before all rounds completed.";
